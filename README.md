@@ -66,10 +66,12 @@ dependencies {
 
     runtime "org.slf4j:slf4j-simple:2.0.16"
     provided "org.apache.logging.log4j:log4j-api:2.24.1"
+
+    compile path="libs/my-custom.jar"
 }
 ```
 
-A dependency declaration is composed of its scope (as of now, only `compile`, `provided`, and `runtime` are supported), an artifact ID (or coordinates, G:A:V triple), and optionally children `exclude` nodes in `G:A` format.
+A dependency declaration is composed of its scope (as of now, only `compile`, `provided`, and `runtime` are supported), an artifact ID (or coordinates, G:A:V triple), and optionally children `exclude` nodes in `G:A` format. Dependencies can also be sources from local files using the `path` property: `compile path="path/to/jar"`.
 
 Like the former, repositories have their own node as well and it can be used to add new sources as well as disabling the central repo:
 
