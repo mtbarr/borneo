@@ -70,6 +70,7 @@ pub struct BuildConfig {
     pub output: Option<PathBuf>,
     pub shadow: bool,
     pub post_build: Option<String>,
+    pub manifest_entries: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -493,6 +494,25 @@ fn parse_build_config(doc: &KdlDocument, src: &NamedSource<String>) -> miette::R
         .unwrap_or(false);
     let post_build = optional_string_arg_node(node, "post-build");
 
+    let manifest_entries = node
+        .children()
+        .and_then(|c| c.get("manifest"))
+        .and_then(|n| n.children())
+        .map(|c| {
+            c.nodes()
+                .iter()
+                .filter_map(|n| {
+                    let key = n.name().value().to_string();
+                    let val = n.entry(0).and_then(|e| match e.value() {
+                        KdlValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })?;
+                    Some((key, val))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let packaging = match optional_string_arg_node(node, "packaging").as_deref() {
         Some("jar") | None => Packaging::Jar,
         Some("dir") => Packaging::Dir,
@@ -511,6 +531,7 @@ fn parse_build_config(doc: &KdlDocument, src: &NamedSource<String>) -> miette::R
         output,
         shadow,
         post_build,
+        manifest_entries,
     })
 }
 

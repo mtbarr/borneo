@@ -29,3 +29,4 @@ sha2 = "0.11.0"
 thiserror = "2.0.18"
 tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "time", "sync", "fs"] }
 walkdir = "2.5.0"
+zip = { version = "8.5.0", default-features = false, features = ["deflate"] }

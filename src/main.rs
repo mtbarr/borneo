@@ -29,7 +29,6 @@ async fn main() -> Result<()> {
             eprintln!("error: {msg}");
         }
     }
-    eprintln!();
 
     std::process::exit(if result.is_ok() { 0 } else { 1 });
 }
@@ -37,12 +36,15 @@ async fn main() -> Result<()> {
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Build(cmd) => {
-            project::Project::from_build_args(&cmd.build_args)?
+            let b = &cmd.build_args;
+            project::Project::new(&b.project_args, b.out.as_ref(), b.packaging)?
                 .build()
                 .await?;
+            eprintln!();
         }
         Commands::Run(cmd) => {
-            let mut project = project::Project::from_build_args(&cmd.build_args)?;
+            let b = &cmd.build_args;
+            let mut project = project::Project::new(&b.project_args, b.out.as_ref(), b.packaging)?;
             let jar_path = project.build().await?;
 
             let java = java::Java::new()?;
@@ -60,20 +62,23 @@ async fn run(cli: Cli) -> Result<()> {
 
                 java.run(
                     &project.dir,
-                    &project.out,
+                    &project.build_dir,
                     project.class_path_iter(),
                     entry,
                     &native_dirs,
                     &cmd.args,
                 )?;
             }
+            eprintln!();
         }
         Commands::Test(cmd) => {
-            let mut project = project::Project::from_build_args(&cmd.build_args)?;
+            let b = &cmd.build_args;
+            let mut project = project::Project::new(&b.project_args, b.out.as_ref(), b.packaging)?;
             project.test(&cmd).await?;
+            eprintln!();
         }
         Commands::Clean(cmd) => {
-            project::Project::from_project_args(&cmd.project_args)?.clean(cmd.purge)?;
+            project::Project::new(&cmd.project_args, None, None)?.clean(cmd.purge)?;
         }
     }
 

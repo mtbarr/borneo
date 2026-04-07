@@ -3,6 +3,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+pub mod jar;
+
 const STREAM_ENCODING_MIN_VERSION: u32 = 18;
 
 #[cfg(windows)]
@@ -93,27 +95,30 @@ impl Java {
         capture_cmd(&mut cmd, "javac")
     }
 
-    pub fn extract_jar(&self, jar: &Path, dst: &Path) -> Result<std::process::Output> {
-        let mut cmd = Command::new(self.bin("jar"));
-        cmd.current_dir(dst);
-        cmd.arg("xf").arg(jar);
-        capture_cmd(&mut cmd, "jar xf")
-    }
-
     pub fn jar(
         &self,
         base: &Path,
         out: &Path,
         jar_path: &Path,
         entry: Option<&str>,
+        manifest_file: Option<&Path>,
     ) -> Result<std::process::Output> {
         let mut cmd = Command::new(self.bin("jar"));
         cmd.current_dir(base);
 
-        if let Some(entry) = entry {
-            cmd.arg("cfe").arg(jar_path).arg(entry);
-        } else {
-            cmd.arg("cf").arg(jar_path);
+        match (entry, manifest_file) {
+            (Some(entry), Some(manifest)) => {
+                cmd.arg("cfme").arg(jar_path).arg(manifest).arg(entry);
+            }
+            (Some(entry), None) => {
+                cmd.arg("cfe").arg(jar_path).arg(entry);
+            }
+            (None, Some(manifest)) => {
+                cmd.arg("cfm").arg(jar_path).arg(manifest);
+            }
+            (None, None) => {
+                cmd.arg("cf").arg(jar_path);
+            }
         }
 
         cmd.arg("-C").arg(out).arg(".");

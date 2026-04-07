@@ -163,7 +163,7 @@ impl MavenLoader {
         }
 
         if !invalidated_keys.is_empty() {
-            let mut reverse_deps: HashMap<ArtifactKey, Vec<ArtifactKey>> = HashMap::new();
+            let mut reverse_deps: HashMap<_, Vec<_>> = HashMap::new();
             for la in &lock.artifacts {
                 for dep_coord in la.dependencies.keys() {
                     reverse_deps

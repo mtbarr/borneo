@@ -1,4 +1,5 @@
 /target
+example/
 .DS_Store
 .idea/
 *.iml

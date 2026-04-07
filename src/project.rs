@@ -8,7 +8,8 @@ use camino::Utf8PathBuf;
 use futures_util::StreamExt;
 
 use crate::{
-    cli::{BuildArgs, ProjectArgs},
+    cli::ProjectArgs,
+    java::jar::JarWriter,
     manifest::{
         self, Packaging, Scope,
         lock::{self, Checksum, Lock, LockArtifact},
@@ -20,9 +21,18 @@ use crate::{
 
 const NATIVE_EXTENSIONS: &[&str] = &["dll", "so", "dylib"];
 
+fn resolve_path(base: &Path, user: &Option<PathBuf>, default: impl AsRef<Path>) -> PathBuf {
+    match user {
+        Some(p) if p.is_absolute() => p.clone(),
+        Some(p) => base.join(p),
+        None => base.join(default),
+    }
+}
+
 pub struct Project {
     pub dir: PathBuf,
-    pub out: PathBuf,
+    pub build_dir: PathBuf,
+    pub out: Option<PathBuf>,
     source: PathBuf,
     resources: Option<PathBuf>,
     packaging: Packaging,
@@ -31,7 +41,11 @@ pub struct Project {
 }
 
 impl Project {
-    fn resolve_dir(project: &ProjectArgs) -> Result<PathBuf> {
+    pub fn new(
+        project: &ProjectArgs,
+        out: Option<&PathBuf>,
+        packaging: Option<Packaging>,
+    ) -> Result<Self> {
         let dir = match &project.base {
             Some(base) => base
                 .canonicalize()
@@ -43,92 +57,36 @@ impl Project {
             "base path is not a directory: {}",
             dir.display()
         );
-        Ok(dir)
-    }
 
-    fn load_manifest(project: &ProjectArgs) -> Result<Option<manifest::Manifest>> {
-        let manifest_path = project.manifest.as_deref().unwrap_or("borneo.kdl".as_ref());
-        if manifest_path.is_file() {
-            let source = std::fs::read_to_string(manifest_path)
+        let manifest_path = resolve_path(&dir, &project.manifest, "borneo.kdl");
+        let manifest = if manifest_path.is_file() {
+            let source = std::fs::read_to_string(&manifest_path)
                 .with_context(|| format!("failed to read manifest: {}", manifest_path.display()))?;
             let name = manifest_path.display().to_string();
-            Ok(Some(manifest::Manifest::parse(&source, &name).map_err(
-                |e| {
-                    status::StatusHandle::get().fatal(format!("{e:?}"));
-                    anyhow::anyhow!("")
-                },
-            )?))
+            Some(manifest::Manifest::parse(&source, &name).map_err(|e| {
+                status::StatusHandle::get().fatal(format!("{e:?}"));
+                anyhow::anyhow!("")
+            })?)
         } else {
-            Ok(None)
-        }
-    }
+            None
+        };
 
-    pub fn from_project_args(project: &ProjectArgs) -> Result<Self> {
-        let dir = Self::resolve_dir(project)?;
-        let manifest = Self::load_manifest(project)?;
+        let build_dir = dir.join("build");
 
-        let out = dir.join("build");
-        let source = dir.join(
-            manifest
-                .as_ref()
-                .map(|m| m.source.as_path())
-                .unwrap_or(Path::new("src/main/java")),
-        );
-        let resources = Self::resolve_resources(&manifest, &dir)?;
-
-        Ok(Self {
-            dir: dir.clone(),
-            out,
-            source,
-            resources,
-            packaging: Packaging::default(),
-            class_path: BTreeMap::from([(dir, Scope::Compile)]),
-            manifest,
-        })
-    }
-
-    pub fn from_build_args(build: &BuildArgs) -> Result<Self> {
-        let dir = Self::resolve_dir(&build.project_args)?;
-        let manifest = Self::load_manifest(&build.project_args)?;
-
-        let out = build
-            .out
-            .as_ref()
-            .map(|o| o.to_path_buf())
+        let out = out
+            .map(|o| resolve_path(&dir, &Some(o.clone()), ""))
             .or_else(|| {
                 manifest
                     .as_ref()
                     .and_then(|m| m.build.output.clone())
                     .map(|o| dir.join(o))
-            })
-            .unwrap_or_else(|| dir.join("build"));
+            });
 
-        if out.extension().is_some_and(|ext| ext == "jar") {
-            if let Some(parent) = out.parent() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("failed to create output directory: {}", parent.display())
-                })?;
-            }
-        } else {
-            std::fs::create_dir_all(&out)
-                .with_context(|| format!("failed to create output directory: {}", out.display()))?;
-        }
-
-        let packaging = build.packaging.unwrap_or_else(|| {
-            if let Some(m) = &manifest {
-                if m.build
-                    .output
-                    .as_ref()
-                    .is_some_and(|o| o.extension().is_some_and(|ext| ext == "jar"))
-                {
-                    return Packaging::Jar;
-                }
-                m.build.packaging
-            } else if out.extension().is_some_and(|ext| ext == "jar") {
-                Packaging::Jar
-            } else {
-                Packaging::default()
-            }
+        let packaging = packaging.unwrap_or_else(|| {
+            manifest
+                .as_ref()
+                .map(|m| m.build.packaging)
+                .unwrap_or_default()
         });
 
         let source = dir.join(
@@ -137,16 +95,12 @@ impl Project {
                 .map(|m| m.source.as_path())
                 .unwrap_or(Path::new("src/main/java")),
         );
-        ensure!(
-            source.is_dir(),
-            "source directory does not exist: {}",
-            source.display()
-        );
 
         let resources = Self::resolve_resources(&manifest, &dir)?;
 
         Ok(Self {
             dir: dir.clone(),
+            build_dir,
             out,
             source,
             resources,
@@ -244,8 +198,7 @@ impl Project {
             .unwrap_or_default()
             .to_vec();
 
-        let build_dir = self.dir.join("build");
-        let classes_dir = build_dir.join("classes");
+        let classes_dir = self.build_dir.join("classes");
 
         if classes_dir.exists() {
             std::fs::remove_dir_all(&classes_dir).context("failed to clean classes directory")?;
@@ -291,52 +244,88 @@ impl Project {
             Packaging::Jar => {
                 let shadow = self.manifest.as_ref().is_some_and(|m| m.build.shadow);
 
-                let jar_path = if self.out.extension().is_some_and(|ext| ext == "jar") {
-                    self.out.clone()
+                let base_name = self
+                    .manifest
+                    .as_ref()
+                    .map(|m| format!("{}-{}", m.artifact, m.version))
+                    .unwrap_or_else(|| "output".into());
+
+                let slim_jar = self.build_dir.join(format!("{base_name}.jar"));
+
+                let final_jar = if shadow {
+                    self.out
+                        .clone()
+                        .unwrap_or_else(|| self.build_dir.join(format!("{base_name}-all.jar")))
                 } else {
-                    let suffix = if shadow { "-all.jar" } else { ".jar" };
-                    let jar_name = self
-                        .manifest
-                        .as_ref()
-                        .map(|m| format!("{}-{}{suffix}", m.artifact, m.version))
-                        .unwrap_or_else(|| format!("output{suffix}"));
-                    self.out.join(jar_name)
+                    self.out.clone().unwrap_or_else(|| slim_jar.clone())
                 };
 
                 let status = status::StatusHandle::get();
 
+                if slim_jar.exists() {
+                    std::fs::remove_file(&slim_jar).ok();
+                }
+                if shadow && final_jar.exists() {
+                    std::fs::remove_file(&final_jar).ok();
+                }
+
+                let entry = self.manifest.as_ref().and_then(|m| m.entry.as_deref());
+                let manifest_entries = self
+                    .manifest
+                    .as_ref()
+                    .map(|m| m.build.manifest_entries.as_slice())
+                    .unwrap_or_default();
+                let manifest_file = if manifest_entries.is_empty() {
+                    None
+                } else {
+                    let path = self.build_dir.join("MANIFEST.MF");
+                    let mut contents = String::from("Manifest-Version: 1.0\n");
+                    for (k, v) in manifest_entries {
+                        contents.push_str(&format!("{k}: {v}\n"));
+                    }
+                    contents.push('\n');
+                    std::fs::write(&path, contents).context("failed to write MANIFEST.MF")?;
+                    Some(path)
+                };
+
+                let rel_slim = slim_jar.strip_prefix(&self.dir).unwrap_or(&slim_jar);
+                let output = status.task(
+                    "package",
+                    format!("packaging {}", rel_slim.display()),
+                    format!("packaged {}", rel_slim.display()),
+                    || {
+                        java.jar(
+                            &self.dir,
+                            &classes_dir,
+                            &slim_jar,
+                            entry,
+                            manifest_file.as_deref(),
+                        )
+                    },
+                )?;
+                flush_output(&output);
+
                 if shadow {
+                    let rel_final = final_jar.strip_prefix(&self.dir).unwrap_or(&final_jar);
                     status.task(
                         "shadow",
-                        "bundling dependencies",
-                        "bundled dependencies into shadow jar",
+                        format!("bundling {}", rel_final.display()),
+                        format!("bundled {}", rel_final.display()),
                         || {
+                            let mut writer = JarWriter::new(&final_jar);
+                            writer.copy_jar_contents(&slim_jar);
                             for (path, scope) in &self.class_path {
                                 if matches!(scope, Scope::Compile | Scope::Runtime)
                                     && path.extension().is_some_and(|ext| ext == "jar")
                                 {
-                                    unpack_jar(&java, path, &classes_dir)?;
+                                    writer.copy_jar_contents(path);
                                 }
                             }
+                            writer.flush();
                             Ok(())
                         },
                     )?;
                 }
-
-                if jar_path.exists() {
-                    std::fs::remove_file(&jar_path).ok();
-                    std::fs::remove_dir_all(&jar_path).ok();
-                }
-
-                let rel_jar = jar_path.strip_prefix(&self.dir).unwrap_or(&jar_path);
-                let entry = self.manifest.as_ref().and_then(|m| m.entry.as_deref());
-                let output = status.task(
-                    "package",
-                    format!("packaging {}", rel_jar.display()),
-                    format!("packaged {}", rel_jar.display()),
-                    || java.jar(&self.dir, &classes_dir, &jar_path, entry),
-                )?;
-                flush_output(&output);
 
                 if let Some(post_build) = self
                     .manifest
@@ -347,13 +336,13 @@ impl Project {
                         "post-build",
                         format!("running: {post_build}"),
                         format!("post-build: {post_build}"),
-                        || run_post_build(&self.dir, post_build, &jar_path),
+                        || run_post_build(&self.dir, post_build, &final_jar),
                     )?;
                     status.output(output.stdout);
                     status.output(output.stderr);
                 }
 
-                Ok(Some(jar_path))
+                Ok(Some(final_jar))
             }
         }
     }
@@ -362,15 +351,18 @@ impl Project {
         if purge {
             return self.purge_cache();
         }
-        if self.out.exists() {
-            std::fs::remove_dir_all(&self.out).with_context(|| {
-                format!("failed to remove build directory: {}", self.out.display())
+        if self.build_dir.exists() {
+            std::fs::remove_dir_all(&self.build_dir).with_context(|| {
+                format!(
+                    "failed to remove build directory: {}",
+                    self.build_dir.display()
+                )
             })?;
             eprintln!(
                 "cleaned {}",
-                self.out
+                self.build_dir
                     .strip_prefix(&self.dir)
-                    .unwrap_or(&self.out)
+                    .unwrap_or(&self.build_dir)
                     .display()
             );
         }
@@ -378,7 +370,7 @@ impl Project {
     }
 
     fn purge_cache(&self) -> Result<()> {
-        let cache_dir = self.dir.join("build").join("cache");
+        let cache_dir = self.build_dir.join("cache");
         if !cache_dir.is_dir() {
             return Ok(());
         }
@@ -386,7 +378,7 @@ impl Project {
         let lock_path = self.dir.join("borneo.lock");
         let lock = read_lock(&lock_path)?;
 
-        let locked_files: BTreeSet<String> = lock
+        let locked_files: BTreeSet<_> = lock
             .as_ref()
             .map(|l| {
                 l.artifacts
@@ -447,7 +439,7 @@ impl Project {
                 "test requires org.junit.platform:junit-platform-console-standalone as a test dependency",
             )?;
 
-        let test_classes_dir = self.dir.join("build").join("test-classes");
+        let test_classes_dir = self.build_dir.join("test-classes");
         if test_classes_dir.exists() {
             std::fs::remove_dir_all(&test_classes_dir)
                 .context("failed to clean test-classes directory")?;
@@ -542,7 +534,7 @@ impl Project {
             return Ok(());
         };
 
-        let cache_dir = self.dir.join("build").join("cache");
+        let cache_dir = self.build_dir.join("cache");
         std::fs::create_dir_all(&cache_dir).context("failed to create cache directory")?;
 
         let lock_path = self.dir.join("borneo.lock");
@@ -832,31 +824,6 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
             std::fs::copy(entry.path(), &target)?;
         }
     }
-    Ok(())
-}
-
-fn unpack_jar(java: &crate::java::Java, jar: &Path, dst: &Path) -> Result<()> {
-    let tmp = dst.join(".shadow-tmp");
-    if tmp.exists() {
-        std::fs::remove_dir_all(&tmp)?;
-    }
-    std::fs::create_dir_all(&tmp)?;
-
-    java.extract_jar(jar, &tmp)
-        .with_context(|| format!("failed to unpack {}", jar.display()))?;
-
-    for entry in walkdir::WalkDir::new(&tmp) {
-        let entry = entry?;
-        let rel = entry.path().strip_prefix(&tmp).unwrap();
-        let target = dst.join(rel);
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&target)?;
-        } else if !target.exists() {
-            std::fs::copy(entry.path(), &target)?;
-        }
-    }
-
-    std::fs::remove_dir_all(&tmp)?;
     Ok(())
 }
 
