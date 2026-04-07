@@ -37,6 +37,7 @@ enum CacheEntry<V> {
 #[derive(Clone)]
 struct ArtifactSlot {
     rank: Rank,
+    coord: ArtifactCoordinates,
     entry: CacheEntry<ResolvedArtifact>,
 }
 
@@ -96,7 +97,10 @@ pub struct MavenLoader {
 }
 
 impl MavenLoader {
-    pub fn new(repos: &[crate::manifest::RepoEntry], strategy: crate::manifest::RepoStrategy) -> Arc<Self> {
+    pub fn new(
+        repos: &[crate::manifest::RepoEntry],
+        strategy: crate::manifest::RepoStrategy,
+    ) -> Arc<Self> {
         let super_pom = XmlFile::from_str(include_str!("./pom-4.1.0.xml"))
             .expect("built-in super POM is valid");
         let client = reqwest::Client::builder()
@@ -250,6 +254,7 @@ impl MavenLoader {
                 lock_artifact.coord.key(),
                 ArtifactSlot {
                     rank,
+                    coord: lock_artifact.coord.clone(),
                     entry: CacheEntry::Ready((Some(repo), resolved)),
                 },
             );
@@ -265,11 +270,13 @@ impl MavenLoader {
         let rank: Rank = (branch.depth, branch.position.clone());
 
         let tx = match self.artifacts.entry(key.clone()) {
+            dashmap::Entry::Occupied(e) if e.get().coord == coord => return Ok(()),
             dashmap::Entry::Occupied(e) if e.get().rank <= rank => return Ok(()),
             dashmap::Entry::Occupied(mut e) => {
                 let (tx, rx) = watch::channel(None);
                 e.insert(ArtifactSlot {
                     rank: rank.clone(),
+                    coord: coord.clone(),
                     entry: CacheEntry::Loading(rx),
                 });
                 tx
@@ -278,6 +285,7 @@ impl MavenLoader {
                 let (tx, rx) = watch::channel(None);
                 e.insert(ArtifactSlot {
                     rank: rank.clone(),
+                    coord: coord.clone(),
                     entry: CacheEntry::Loading(rx),
                 });
                 tx
@@ -308,15 +316,22 @@ impl MavenLoader {
         StatusHandle::get().resolved(&coord);
 
         let entry = (Some(repo), artifact);
-        self.artifacts.insert(
-            key,
-            ArtifactSlot {
-                rank,
-                entry: CacheEntry::Ready(entry.clone()),
-            },
-        );
-
+        let slot = ArtifactSlot {
+            rank: rank.clone(),
+            coord,
+            entry: CacheEntry::Ready(entry.clone()),
+        };
         let _ = tx.send(Some(entry));
+
+        match self.artifacts.entry(key) {
+            dashmap::Entry::Occupied(mut entry) if rank <= entry.get().rank => {
+                entry.insert(slot);
+            }
+            dashmap::Entry::Vacant(entry) => {
+                entry.insert(slot);
+            }
+            _ => {}
+        }
 
         Ok(())
     }
@@ -351,6 +366,10 @@ impl MavenLoader {
         let mut dep_coords = BTreeMap::new();
 
         for (i, dep) in pom.dependencies.iter().enumerate() {
+            if dep.optional {
+                continue;
+            }
+
             let pom_scope = match dep.scope {
                 DependencyScope::Compile => PomScope::Compile,
                 DependencyScope::Runtime => PomScope::Runtime,
@@ -398,12 +417,14 @@ impl MavenLoader {
                     dashmap::Entry::Occupied(mut existing) => {
                         existing.insert(ArtifactSlot {
                             rank,
+                            coord,
                             entry: CacheEntry::Failed(err),
                         });
                     }
                     dashmap::Entry::Vacant(vacant) => {
                         vacant.insert(ArtifactSlot {
                             rank,
+                            coord,
                             entry: CacheEntry::Failed(err),
                         });
                     }

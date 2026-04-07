@@ -6,7 +6,7 @@ use std::{
 };
 
 use camino::Utf8PathBuf;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 
 use crate::types::{ArtifactId, ArtifactKey, ArtifactVersion, GroupId};
 
@@ -76,18 +76,6 @@ impl Pom {
     }
 }
 
-fn unwrap_dependencies<'de, D>(deserializer: D) -> Result<Vec<Dependency>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    struct Dependencies {
-        #[serde(default)]
-        dependency: Vec<Dependency>,
-    }
-    Ok(Dependencies::deserialize(deserializer)?.dependency)
-}
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Dependency {
@@ -100,6 +88,9 @@ pub struct Dependency {
 
     #[serde(default)]
     pub scope: DependencyScope,
+
+    #[serde(default)]
+    pub optional: bool,
 
     pub system_path: Option<String>,
 

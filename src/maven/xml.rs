@@ -395,6 +395,18 @@ mod de {
         fn deserialize_string<V: Visitor<'de>>(self, v: V) -> Result<V::Value> {
             self.deserialize_any(v)
         }
+        fn deserialize_bool<V>(self, visitor: V) -> std::result::Result<V::Value, Self::Error>
+        where
+            V: Visitor<'de>,
+        {
+            match self {
+                XmlNode::Text(s) => visitor.visit_bool(
+                    s.parse::<bool>()
+                        .map_err(|e| Error::Custom(e.to_string()))?,
+                ),
+                _ => Err(Error::Custom("expected a bool".to_string())),
+            }
+        }
         fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
             visitor.visit_some(self)
         }
@@ -427,7 +439,7 @@ mod de {
         }
 
         serde::forward_to_deserialize_any! {
-            bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64
+            i8 i16 i32 i64 u8 u16 u32 u64 f32 f64
             char bytes byte_buf unit unit_struct newtype_struct
             tuple tuple_struct map identifier ignored_any
         }
