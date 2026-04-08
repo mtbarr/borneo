@@ -45,8 +45,11 @@ group "com.example"
 artifact "my-app"
 version "1.0.0"
 entry "com.example.Main"
-source "src/"
 resources "assets/"
+
+java {
+    source "src/"
+}
 ```
 
 ### Repositories and dependencies
@@ -143,11 +146,20 @@ dependencies {
 }
 
 build {
+    // the _final_ JAR destination, if shadow is enabled, the fat JAR will be written output
     output "./path/to/my.jar"
-    shadow "true"
 
+    // enables shadowing of dependencies
+    shadow
+    // or, optionally exclude certain dependencies
+    shadow {
+        exclude "com.google.guava:guava-parent"
+    }
+
+    // a shell command to be executed after the build step. BORNEO_BUILD_OUTPUT is an absolute path to the output JAR
     post-build "echo $BORNEO_BUILD_OUTPUT"
 
+    // K-V list of entries to write to MANIFEST.MF
     manifest {
         Implementation-Title "My App"
         Implementation-Version "1.0.0"
@@ -156,20 +168,46 @@ build {
 }
 ```
 
-These are all the relevant build options. `manifest` is written as a K-V list of entries to be written to `META-INF/MANIFEST.MF`. `shadow` toggles bundling of dependencies into your final JAR, if no `output` is declared, it will be located in `build/my-artifact-0.1.0-all.jar`. `post-build` executes a shell command after the build step, and has the `BORNEO_BUILD_OUTPUT` environment variable available.
-
 ### Java node
 
 A `java` node is available. It allows you to declare the minimum supported Java release and common compiler arguments you might want to pass to `javac` invocations:
 
 ```kdl
 java {
-    release "21"
     compiler-args "-Xlint:deprecation" "-Xlint:unchecked"
+}
+// OR: enforce a minimum release
+java "21" {
+    test-source "test/java"
 }
 ```
 
-If the `JAVA_HOME` version is older than the one in `release`, Borneo will raise an error.
+### Kotlin
+
+Kotlin support is WIP, but it works. Enabling it is easy:
+
+```kdl
+group "com.example"
+artifact "my-kotlin-app"
+version "1.0.0"
+
+kotlin "2.3.20"
+// OR: the same configuration parameters as in the java node
+kotlin "2.3.20" {
+    source "src/kotlin"
+}
+// OR: use version in KOTLIN_HOME env var
+kotlin
+```
+
+If a version is specified, Borneo will download `kotlinc` to `build/kotlin`. The source defaults to `src/main/kotlin`. Note that this by itself does not include the `stdlib` and `reflect` dependencies, so make sure to add them:
+
+```kdl
+dependencies {
+    compile "org.jetbrains.kotlin:kotlin-stdlib:2.3.20"
+    compile "org.jetbrains.kotlin:kotlin-reflect:2.3.20"
+}
+```
 
 ### Testing
 
@@ -177,7 +215,6 @@ Testing is in... a rough shape. It is somewhat supported if you run more modern 
 
 ```kdl
 test {
-    source "src/test/java"
     resources "src/test/resources"
     jvm-args "-Xmx512m" "-ea"
 }

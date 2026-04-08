@@ -5,6 +5,7 @@ use crate::cli::{Cli, Commands};
 
 mod cli;
 mod java;
+mod kotlin;
 mod manifest;
 mod maven;
 mod project;
@@ -47,12 +48,13 @@ async fn run(cli: Cli) -> Result<()> {
             let mut project = project::Project::new(&b.project_args, b.out.as_ref(), b.packaging)?;
             let jar_path = project.build().await?;
 
-            let java = java::Java::new()?;
             let native_dirs = project.native_library_dirs();
             eprintln!();
 
             if let Some(jar_path) = jar_path {
-                java.run_jar(&project.dir, &jar_path, &native_dirs, &cmd.args)?;
+                project
+                    .java()
+                    .run_jar(&project.dir, &jar_path, &native_dirs, &cmd.args)?;
             } else {
                 let entry = cmd
                     .entry
@@ -60,7 +62,7 @@ async fn run(cli: Cli) -> Result<()> {
                     .or(project.manifest.as_ref().and_then(|m| m.entry.as_ref()))
                     .context("no entry point specified and none found in manifest")?;
 
-                java.run(
+                project.java().run(
                     &project.dir,
                     &project.build_dir,
                     project.class_path_iter(),

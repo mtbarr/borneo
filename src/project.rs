@@ -29,11 +29,22 @@ fn resolve_path(base: &Path, user: &Option<PathBuf>, default: impl AsRef<Path>) 
     }
 }
 
+pub trait Compiler {
+    fn name(&self) -> &str;
+    fn source(&self) -> &Path;
+    fn compile(
+        &self,
+        project: &Project,
+        out: &Path,
+        files: &[PathBuf],
+    ) -> Result<std::process::Output>;
+}
+
 pub struct Project {
     pub dir: PathBuf,
     pub build_dir: PathBuf,
     pub out: Option<PathBuf>,
-    source: PathBuf,
+    java: Option<crate::java::Java>,
     resources: Option<PathBuf>,
     packaging: Packaging,
     pub class_path: BTreeMap<PathBuf, Scope>,
@@ -41,6 +52,17 @@ pub struct Project {
 }
 
 impl Project {
+    pub fn java(&self) -> &crate::java::Java {
+        self.java.as_ref().expect("java not initialized")
+    }
+
+    fn ensure_java(&mut self) -> Result<()> {
+        if self.java.is_none() {
+            self.java = Some(crate::java::Java::new()?);
+        }
+        Ok(())
+    }
+
     pub fn new(
         project: &ProjectArgs,
         out: Option<&PathBuf>,
@@ -89,20 +111,13 @@ impl Project {
                 .unwrap_or_default()
         });
 
-        let source = dir.join(
-            manifest
-                .as_ref()
-                .map(|m| m.source.as_path())
-                .unwrap_or(Path::new("src/main/java")),
-        );
-
         let resources = Self::resolve_resources(&manifest, &dir)?;
 
         Ok(Self {
             dir: dir.clone(),
             build_dir,
             out,
-            source,
+            java: None,
             resources,
             packaging,
             class_path: BTreeMap::from([(dir, Scope::Compile)]),
@@ -158,32 +173,13 @@ impl Project {
         }
     }
 
-    async fn compile_main(&mut self) -> Result<(crate::java::Java, PathBuf)> {
-        let mut files = Vec::with_capacity(1);
-
-        for entry in walkdir::WalkDir::new(&self.source) {
-            let entry = entry.context("failed to walk source directory")?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-
-            files.push(
-                entry
-                    .into_path()
-                    .canonicalize()
-                    .context("failed to canonicalize source file")?,
-            );
-        }
-
-        self.resolve_dependencies().await?;
-        self.class_path.insert(self.source.clone(), Scope::Compile);
-
-        let java = crate::java::Java::new()?;
+    async fn compile_main(&mut self) -> Result<PathBuf> {
+        self.ensure_java()?;
 
         if let Some(manifest) = &self.manifest
             && let Some(required) = manifest.java.release
         {
-            let actual = java.major_version();
+            let actual = self.java().major_version();
             ensure!(
                 actual.is_some_and(|v| v >= required),
                 "project requires Java {required} but JAVA_HOME provides {}",
@@ -191,48 +187,106 @@ impl Project {
             );
         }
 
-        let compiler_args = self
-            .manifest
-            .as_ref()
-            .map(|m| m.java.compiler_args.as_slice())
-            .unwrap_or_default()
-            .to_vec();
+        let compilers = self.build_compilers().await?;
+        ensure!(!compilers.is_empty(), "no source directories found");
+
+        self.resolve_dependencies().await?;
 
         let classes_dir = self.build_dir.join("classes");
-
         if classes_dir.exists() {
             std::fs::remove_dir_all(&classes_dir).context("failed to clean classes directory")?;
         }
         std::fs::create_dir_all(&classes_dir).context("failed to create classes directory")?;
 
+        for compiler in &compilers {
+            self.class_path
+                .insert(compiler.source().to_path_buf(), Scope::Compile);
+        }
+
         let status = status::StatusHandle::get();
-        let file_count = files.len();
-        let output = status.task(
-            "compile",
-            format!("compiling {file_count} source files"),
-            format!("compiled {file_count} source files"),
-            || {
-                java.javac(
-                    &self.dir,
-                    &classes_dir,
-                    self.class_path_iter(),
-                    self.processor_path_iter(),
-                    &files,
-                    &compiler_args,
-                )
-            },
-        )?;
-        flush_output(&output);
+        for compiler in &compilers {
+            let files = collect_source_files(compiler.source())?;
+            if files.is_empty() {
+                continue;
+            }
+            let file_count = files.len();
+            let name = compiler.name();
+            let output = status.task(
+                name,
+                format!("compiling {file_count} source files"),
+                format!("compiled {file_count} source files"),
+                || compiler.compile(self, &classes_dir, &files),
+            )?;
+            flush_output(&output);
+        }
 
         if let Some(resources) = &self.resources {
             copy_dir_contents(resources, &classes_dir)?;
         }
 
-        Ok((java, classes_dir))
+        Ok(classes_dir)
+    }
+
+    async fn build_compilers(&self) -> Result<Vec<Box<dyn Compiler>>> {
+        let mut compilers: Vec<Box<dyn Compiler>> = Vec::new();
+
+        let Some(manifest) = &self.manifest else {
+            compilers.push(Box::new(crate::java::JavaCompiler::new(
+                self.dir.join("src/main/java"),
+                Vec::new(),
+            )));
+            return Ok(compilers);
+        };
+
+        if let Some(kotlin_config) = &manifest.kotlin {
+            let kotlin_source = self.dir.join(&kotlin_config.compiler.source);
+            ensure!(
+                kotlin_source.is_dir(),
+                "kotlin source directory does not exist: {}",
+                kotlin_source.display()
+            );
+            let kotlin =
+                crate::kotlin::Kotlin::new(kotlin_config.version.as_deref(), &self.build_dir)
+                    .await?;
+            compilers.push(Box::new(crate::kotlin::KotlinCompiler::new(
+                kotlin,
+                kotlin_source,
+                kotlin_config.compiler.compiler_args.clone(),
+            )));
+        } else {
+            let default_kotlin = self.dir.join("src/main/kotlin");
+            if default_kotlin.is_dir() {
+                eprintln!(
+                    "warning: src/main/kotlin exists but kotlin is not declared in the manifest"
+                );
+            }
+        }
+
+        let java_source = self.dir.join(&manifest.java.compiler.source);
+        if manifest.kotlin.is_some() {
+            if java_source.is_dir() {
+                compilers.push(Box::new(crate::java::JavaCompiler::new(
+                    java_source,
+                    manifest.java.compiler.compiler_args.clone(),
+                )));
+            }
+        } else {
+            ensure!(
+                java_source.is_dir(),
+                "source directory does not exist: {}",
+                java_source.display()
+            );
+            compilers.push(Box::new(crate::java::JavaCompiler::new(
+                java_source,
+                manifest.java.compiler.compiler_args.clone(),
+            )));
+        }
+
+        Ok(compilers)
     }
 
     pub async fn build(&mut self) -> Result<Option<PathBuf>> {
-        let (java, classes_dir) = self.compile_main().await?;
+        let classes_dir = self.compile_main().await?;
 
         match self.packaging {
             Packaging::Dir => {
@@ -242,7 +296,7 @@ impl Project {
                 Ok(None)
             }
             Packaging::Jar => {
-                let shadow = self.manifest.as_ref().is_some_and(|m| m.build.shadow);
+                let shadow = self.manifest.as_ref().and_then(|m| m.build.shadow.as_ref());
 
                 let base_name = self
                     .manifest
@@ -260,7 +314,7 @@ impl Project {
                     }
                 };
 
-                let final_jar = if shadow {
+                let final_jar = if shadow.is_some() {
                     resolve_out(format!("{base_name}-all.jar"))
                 } else {
                     resolve_out(format!("{base_name}.jar"))
@@ -271,7 +325,7 @@ impl Project {
                 if slim_jar.exists() {
                     std::fs::remove_file(&slim_jar).ok();
                 }
-                if shadow && final_jar.exists() {
+                if shadow.is_some() && final_jar.exists() {
                     std::fs::remove_file(&final_jar).ok();
                 }
 
@@ -300,7 +354,7 @@ impl Project {
                     format!("packaging {}", rel_slim.display()),
                     format!("packaged {}", rel_slim.display()),
                     || {
-                        java.jar(
+                        self.java().jar(
                             &self.dir,
                             &classes_dir,
                             &slim_jar,
@@ -311,7 +365,7 @@ impl Project {
                 )?;
                 flush_output(&output);
 
-                if shadow {
+                if let Some(shadow_config) = shadow {
                     let rel_final = final_jar.strip_prefix(&self.dir).unwrap_or(&final_jar);
                     status.task(
                         "shadow",
@@ -319,12 +373,12 @@ impl Project {
                         format!("bundled {}", rel_final.display()),
                         || {
                             let mut writer = JarWriter::new(&final_jar);
-                            writer.copy_jar_contents(&slim_jar);
+                            writer.copy_jar_contents(&slim_jar, &Default::default());
                             for (path, scope) in &self.class_path {
                                 if matches!(scope, Scope::Compile | Scope::Runtime)
                                     && path.extension().is_some_and(|ext| ext == "jar")
                                 {
-                                    writer.copy_jar_contents(path);
+                                    writer.copy_jar_contents(path, &shadow_config.exclusions);
                                 }
                             }
                             writer.flush();
@@ -430,7 +484,7 @@ impl Project {
             "test requires a borneo.kdl manifest"
         );
 
-        let (java, classes_dir) = self.compile_main().await?;
+        let classes_dir = self.compile_main().await?;
         let manifest = self.manifest.as_ref().unwrap();
 
         const STANDALONE_PREFIX: &str = "org.junit.platform-junit-platform-console-standalone-";
@@ -466,8 +520,8 @@ impl Project {
         std::fs::create_dir_all(&test_classes_dir)
             .context("failed to create test-classes directory")?;
 
-        let compiler_args = manifest.java.compiler_args.clone();
-        let test_source = self.dir.join(&manifest.test.source);
+        let compiler_args = manifest.java.compiler.compiler_args.clone();
+        let test_source = self.dir.join(&manifest.java.compiler.test_source);
         ensure!(
             test_source.is_dir(),
             "test source directory does not exist: {}",
@@ -497,7 +551,7 @@ impl Project {
             format!("compiling {test_file_count} test files"),
             format!("compiled {test_file_count} test files"),
             || {
-                java.javac(
+                self.java().javac(
                     &self.dir,
                     &test_classes_dir,
                     test_cp.iter(),
@@ -536,7 +590,7 @@ impl Project {
         }
 
         status.log("running tests");
-        java.run_tests(
+        self.java().run_tests(
             &self.dir,
             &standalone_jar,
             standalone_major,
@@ -834,6 +888,23 @@ fn read_lock(path: &Path) -> Result<Option<Lock>> {
 
 fn write_lock(path: &Path, lock: &Lock) -> Result<()> {
     std::fs::write(path, lock.to_kdl()).context("failed to write lock file")
+}
+
+fn collect_source_files(source: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(source) {
+        let entry = entry.context("failed to walk source directory")?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        files.push(
+            entry
+                .into_path()
+                .canonicalize()
+                .context("failed to canonicalize source file")?,
+        );
+    }
+    Ok(files)
 }
 
 fn flush_output(output: &std::process::Output) {

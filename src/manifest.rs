@@ -12,6 +12,12 @@ use crate::types::{
 
 pub mod lock;
 
+pub struct CompilerConfig {
+    pub source: PathBuf,
+    pub test_source: PathBuf,
+    pub compiler_args: Vec<String>,
+}
+
 pub struct Manifest {
     pub group: GroupId,
     pub artifact: ArtifactId,
@@ -22,11 +28,11 @@ pub struct Manifest {
 
     pub entry: Option<String>,
 
-    pub source: PathBuf,
-
     pub resources: PathBuf,
 
     pub java: JavaConfig,
+
+    pub kotlin: Option<KotlinConfig>,
 
     pub build: BuildConfig,
 
@@ -44,14 +50,30 @@ pub enum Packaging {
     Jar,
 }
 
-#[derive(Default)]
 pub struct JavaConfig {
     pub release: Option<u32>,
-    pub compiler_args: Vec<String>,
+    pub compiler: CompilerConfig,
+}
+
+impl Default for JavaConfig {
+    fn default() -> Self {
+        Self {
+            release: None,
+            compiler: CompilerConfig {
+                source: PathBuf::from("src/main/java"),
+                test_source: PathBuf::from("src/test/java"),
+                compiler_args: Vec::new(),
+            },
+        }
+    }
+}
+
+pub struct KotlinConfig {
+    pub version: Option<String>,
+    pub compiler: CompilerConfig,
 }
 
 pub struct TestConfig {
-    pub source: PathBuf,
     pub resources: PathBuf,
     pub jvm_args: Vec<String>,
 }
@@ -59,18 +81,21 @@ pub struct TestConfig {
 impl Default for TestConfig {
     fn default() -> Self {
         Self {
-            source: PathBuf::from("src/test/java"),
             resources: PathBuf::from("src/test/resources"),
             jvm_args: Vec::new(),
         }
     }
 }
 
+pub struct ShadowConfig {
+    pub exclusions: BTreeSet<ExclusionKey>,
+}
+
 #[derive(Default)]
 pub struct BuildConfig {
     pub packaging: Packaging,
     pub output: Option<PathBuf>,
-    pub shadow: bool,
+    pub shadow: Option<ShadowConfig>,
     pub post_build: Option<String>,
     pub manifest_entries: Vec<(String, String)>,
 }
@@ -261,14 +286,12 @@ impl Manifest {
         let author = optional_string_arg(&doc, "author");
         let entry = optional_string_arg(&doc, "entry");
 
-        let source_path = optional_string_arg(&doc, "source")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("src/main/java"));
         let resources = optional_string_arg(&doc, "resources")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("src/main/resources"));
 
         let java = parse_java_config(&doc, &src)?;
+        let kotlin = parse_kotlin_config(&doc, &src)?;
         let test = parse_test_config(&doc);
         let build = parse_build_config(&doc, &src)?;
         let repositories = parse_repositories(&doc);
@@ -281,9 +304,9 @@ impl Manifest {
             description,
             author,
             entry,
-            source: source_path,
             resources,
             java,
+            kotlin,
             build,
             test,
             repositories,
@@ -423,9 +446,6 @@ fn parse_test_config(doc: &KdlDocument) -> TestConfig {
         return TestConfig::default();
     };
 
-    let source = optional_string_arg_node(node, "source")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("src/test/java"));
     let resources = optional_string_arg_node(node, "resources")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("src/test/resources"));
@@ -442,9 +462,49 @@ fn parse_test_config(doc: &KdlDocument) -> TestConfig {
         .collect();
 
     TestConfig {
-        source,
         resources,
         jvm_args,
+    }
+}
+
+fn parse_compiler_config(
+    node: &KdlNode,
+    default_source: &str,
+    default_test_source: &str,
+) -> CompilerConfig {
+    let children = node.children();
+
+    let source = children
+        .and_then(|c| c.get_arg("source"))
+        .and_then(|v| match v {
+            KdlValue::String(s) => Some(PathBuf::from(s)),
+            _ => None,
+        })
+        .unwrap_or_else(|| PathBuf::from(default_source));
+
+    let test_source = children
+        .and_then(|c| c.get_arg("test-source"))
+        .and_then(|v| match v {
+            KdlValue::String(s) => Some(PathBuf::from(s)),
+            _ => None,
+        })
+        .unwrap_or_else(|| PathBuf::from(default_test_source));
+
+    let compiler_args = children
+        .into_iter()
+        .flat_map(|c| c.nodes())
+        .filter(|n| n.name().value() == "compiler-args")
+        .flat_map(|n| n.entries())
+        .filter_map(|e| match e.value() {
+            KdlValue::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    CompilerConfig {
+        source,
+        test_source,
+        compiler_args,
     }
 }
 
@@ -452,17 +512,13 @@ fn parse_java_config(doc: &KdlDocument, src: &NamedSource<String>) -> miette::Re
     let Some(node) = doc.get("java") else {
         return Ok(JavaConfig::default());
     };
-    let Some(children) = node.children() else {
-        return Ok(JavaConfig::default());
-    };
 
-    let release = if let Some(val) = children.get_arg("release") {
-        match val {
+    let release = if let Some(entry) = node.entry(0) {
+        match entry.value() {
             KdlValue::Integer(n) => Some(*n as u32),
             KdlValue::String(s) => Some(s.parse::<u32>().map_err(|_| {
-                let span = children.get("release").unwrap().span();
                 miette::miette!(
-                    labels = vec![LabeledSpan::at(span, "expected an integer")],
+                    labels = vec![LabeledSpan::at(entry.span(), "expected an integer")],
                     "invalid java release version: {s}"
                 )
                 .with_source_code(src.clone())
@@ -473,21 +529,38 @@ fn parse_java_config(doc: &KdlDocument, src: &NamedSource<String>) -> miette::Re
         None
     };
 
-    let compiler_args = children
-        .nodes()
-        .iter()
-        .filter(|n| n.name().value() == "compiler-args")
-        .flat_map(|n| n.entries())
-        .filter_map(|e| match e.value() {
-            KdlValue::String(s) => Some(s.clone()),
-            _ => None,
-        })
-        .collect();
-
     Ok(JavaConfig {
         release,
-        compiler_args,
+        compiler: parse_compiler_config(node, "src/main/java", "src/test/java"),
     })
+}
+
+fn parse_kotlin_config(
+    doc: &KdlDocument,
+    src: &NamedSource<String>,
+) -> miette::Result<Option<KotlinConfig>> {
+    let Some(node) = doc.get("kotlin") else {
+        return Ok(None);
+    };
+
+    let version = match node.entry(0) {
+        Some(entry) => match entry.value() {
+            KdlValue::String(s) => Some(s.clone()),
+            _ => {
+                return Err(miette::miette!(
+                    labels = vec![LabeledSpan::at(entry.span(), "expected a string")],
+                    "kotlin version must be a string"
+                )
+                .with_source_code(src.clone()));
+            }
+        },
+        None => None,
+    };
+
+    Ok(Some(KotlinConfig {
+        version,
+        compiler: parse_compiler_config(node, "src/main/kotlin", "src/test/kotlin"),
+    }))
 }
 
 fn parse_build_config(doc: &KdlDocument, src: &NamedSource<String>) -> miette::Result<BuildConfig> {
@@ -498,9 +571,9 @@ fn parse_build_config(doc: &KdlDocument, src: &NamedSource<String>) -> miette::R
     let output = optional_string_arg_node(node, "output").map(PathBuf::from);
     let shadow = node
         .children()
-        .and_then(|c| c.get_arg("shadow"))
-        .and_then(parse_kdl_bool)
-        .unwrap_or(false);
+        .and_then(|c| c.get("shadow"))
+        .map(|n| parse_shadow_config(n, src))
+        .transpose()?;
     let post_build = optional_string_arg_node(node, "post-build");
 
     let manifest_entries = node
@@ -542,6 +615,51 @@ fn parse_build_config(doc: &KdlDocument, src: &NamedSource<String>) -> miette::R
         post_build,
         manifest_entries,
     })
+}
+
+fn parse_shadow_config(node: &KdlNode, src: &NamedSource<String>) -> miette::Result<ShadowConfig> {
+    let mut exclusions = BTreeSet::new();
+    if let Some(children) = node.children() {
+        for child in children.nodes() {
+            if child.name().value() != "exclude" {
+                return Err(miette::miette!(
+                    labels = vec![LabeledSpan::at(child.name().span(), "expected \"exclude\"")],
+                    "unexpected node in shadow block: {}",
+                    child.name().value()
+                )
+                .with_source_code(src.clone()));
+            }
+
+            let entry = child.entry(0).ok_or_else(|| {
+                miette::miette!(
+                    labels = vec![LabeledSpan::at(child.span(), "missing value")],
+                    "exclude requires a \"G:A\" value"
+                )
+                .with_source_code(src.clone())
+            })?;
+
+            match entry.value() {
+                KdlValue::String(s) => {
+                    let key: ExclusionKey = s.parse().map_err(|e: anyhow::Error| {
+                        miette::miette!(
+                            labels = vec![LabeledSpan::at(entry.span(), "invalid artifact key")],
+                            "{e}"
+                        )
+                        .with_source_code(src.clone())
+                    })?;
+                    exclusions.insert(key);
+                }
+                _ => {
+                    return Err(miette::miette!(
+                        labels = vec![LabeledSpan::at(entry.span(), "expected a string")],
+                        "exclude value must be a string"
+                    )
+                    .with_source_code(src.clone()));
+                }
+            }
+        }
+    }
+    Ok(ShadowConfig { exclusions })
 }
 
 fn optional_string_arg_node(node: &KdlNode, name: &str) -> Option<String> {

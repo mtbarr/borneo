@@ -29,7 +29,7 @@ impl Java {
         })
     }
 
-    fn bin(&self, name: &str) -> PathBuf {
+    pub fn bin(&self, name: &str) -> PathBuf {
         self.home.join("bin").join(name)
     }
 
@@ -202,6 +202,43 @@ impl Java {
         cmd.arg("-jar").arg(jar_path);
         cmd.args(args);
         run_cmd(&mut cmd, "java -jar")
+    }
+}
+
+pub struct JavaCompiler {
+    source: PathBuf,
+    args: Vec<String>,
+}
+
+impl JavaCompiler {
+    pub fn new(source: PathBuf, args: Vec<String>) -> Self {
+        Self { source, args }
+    }
+}
+
+impl crate::project::Compiler for JavaCompiler {
+    fn name(&self) -> &str {
+        "javac"
+    }
+
+    fn source(&self) -> &Path {
+        &self.source
+    }
+
+    fn compile(
+        &self,
+        project: &crate::project::Project,
+        out: &Path,
+        files: &[PathBuf],
+    ) -> Result<std::process::Output> {
+        project.java().javac(
+            &project.dir,
+            out,
+            project.class_path_iter(),
+            project.processor_path_iter(),
+            files,
+            &self.args,
+        )
     }
 }
 
