@@ -16,7 +16,7 @@ mod types;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let status_rx = status::StatusHandle::init();
+    let status_rx = status::StatusHandle::init(cli.format);
     let progress = status::spawn_progress(status_rx);
 
     let result = run(cli).await;
@@ -27,7 +27,12 @@ async fn main() -> Result<()> {
     if let Err(e) = &result {
         let msg = format!("{e:#}");
         if !msg.is_empty() {
-            eprintln!("error: {msg}");
+            match status::StatusHandle::get().format() {
+                cli::OutputFormat::Text => eprintln!("error: {msg}"),
+                cli::OutputFormat::Json => {
+                    println!("{}", serde_json::json!({"event": "fatal", "msg": msg}));
+                }
+            }
         }
     }
 
@@ -41,7 +46,7 @@ async fn run(cli: Cli) -> Result<()> {
             project::Project::new(&b.project_args, b.out.as_ref(), b.packaging)?
                 .build()
                 .await?;
-            eprintln!();
+            status::StatusHandle::get().log("");
         }
         Commands::Run(cmd) => {
             let b = &cmd.build_args;
@@ -49,7 +54,7 @@ async fn run(cli: Cli) -> Result<()> {
             let jar_path = project.build().await?;
 
             let native_dirs = project.native_library_dirs();
-            eprintln!();
+            status::StatusHandle::get().log("");
 
             if let Some(jar_path) = jar_path {
                 project
@@ -71,13 +76,13 @@ async fn run(cli: Cli) -> Result<()> {
                     &cmd.args,
                 )?;
             }
-            eprintln!();
+            status::StatusHandle::get().log("");
         }
         Commands::Test(cmd) => {
             let b = &cmd.build_args;
             let mut project = project::Project::new(&b.project_args, b.out.as_ref(), b.packaging)?;
             project.test(&cmd).await?;
-            eprintln!();
+            status::StatusHandle::get().log("");
         }
         Commands::Clean(cmd) => {
             project::Project::new(&cmd.project_args, None, None)?.clean(cmd.purge)?;

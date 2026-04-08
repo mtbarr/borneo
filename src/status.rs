@@ -2,27 +2,35 @@ use anyhow::Result;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::cli::OutputFormat;
 use crate::types::ArtifactCoordinates;
 
 pub(crate) enum Status {
     Begin { key: String, msg: String },
     Update { key: String, msg: String },
-    End(String),
+    End { key: String, msg: Option<String> },
     Clear,
     Fatal(String),
     Log(String),
-    Output(Vec<u8>),
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
 }
 
 pub(crate) static STATUS: std::sync::OnceLock<StatusHandle> = std::sync::OnceLock::new();
 
-pub struct StatusHandle(std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Status>>>);
+pub struct StatusHandle {
+    tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Status>>>,
+    format: OutputFormat,
+}
 
 impl StatusHandle {
-    pub(crate) fn init() -> tokio::sync::mpsc::UnboundedReceiver<Status> {
+    pub(crate) fn init(format: OutputFormat) -> tokio::sync::mpsc::UnboundedReceiver<Status> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         STATUS
-            .set(Self(std::sync::Mutex::new(Some(tx))))
+            .set(Self {
+                tx: std::sync::Mutex::new(Some(tx)),
+                format,
+            })
             .ok()
             .expect("StatusHandle already initialized");
         rx
@@ -33,13 +41,17 @@ impl StatusHandle {
     }
 
     pub(crate) fn send(&self, status: Status) {
-        if let Some(tx) = self.0.lock().unwrap().as_ref() {
+        if let Some(tx) = self.tx.lock().unwrap().as_ref() {
             let _ = tx.send(status);
         }
     }
 
     pub(crate) fn shutdown(&self) {
-        self.0.lock().unwrap().take();
+        self.tx.lock().unwrap().take();
+    }
+
+    pub fn format(&self) -> OutputFormat {
+        self.format
     }
 
     pub fn begin(&self, key: impl Into<String>, msg: impl Into<String>) {
@@ -57,15 +69,25 @@ impl StatusHandle {
     }
 
     pub fn end(&self, key: impl Into<String>) {
-        self.send(Status::End(key.into()));
+        self.send(Status::End {
+            key: key.into(),
+            msg: None,
+        });
+    }
+
+    pub fn end_log(&self, key: impl Into<String>, msg: impl Into<String>) {
+        self.send(Status::End {
+            key: key.into(),
+            msg: Some(msg.into()),
+        });
     }
 
     pub fn resolving(&self, coord: &ArtifactCoordinates) {
-        self.begin(coord.to_string(), format!("resolving {coord}"));
+        self.begin(format!("resolve:{coord}"), format!("resolving {coord}"));
     }
 
     pub fn resolved(&self, coord: &ArtifactCoordinates) {
-        self.end(coord.to_string());
+        self.end(format!("resolve:{coord}"));
     }
 
     pub fn downloading(&self, coord: &ArtifactCoordinates) {
@@ -97,16 +119,23 @@ impl StatusHandle {
     ) -> anyhow::Result<T> {
         self.begin(key, spinner_msg);
         let result = f();
-        self.end(key);
-        if result.is_ok() {
-            self.log(done_msg);
-        }
+        let msg = result.is_ok().then(|| done_msg.into());
+        self.send(Status::End {
+            key: key.to_string(),
+            msg,
+        });
         result
     }
 
-    pub fn output(&self, bytes: Vec<u8>) {
+    pub fn stdout(&self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
-            self.send(Status::Output(bytes));
+            self.send(Status::Stdout(bytes));
+        }
+    }
+
+    pub fn stderr(&self, bytes: Vec<u8>) {
+        if !bytes.is_empty() {
+            self.send(Status::Stderr(bytes));
         }
     }
 }
@@ -164,7 +193,12 @@ impl ProgressDisplay {
                     self.refresh();
                 }
             }
-            Status::End(key) => self.remove(&key),
+            Status::End { key, msg } => {
+                self.remove(&key);
+                if let Some(m) = msg {
+                    self.multi.println(m).ok();
+                }
+            }
             Status::Clear => {
                 self.queue.clear();
                 self.refresh();
@@ -176,7 +210,7 @@ impl ProgressDisplay {
             Status::Log(msg) => {
                 self.multi.println(msg).ok();
             }
-            Status::Output(bytes) => {
+            Status::Stdout(bytes) | Status::Stderr(bytes) => {
                 if let Ok(s) = String::from_utf8(bytes) {
                     for line in s.lines() {
                         self.multi.println(line).ok();
@@ -232,12 +266,93 @@ impl ProgressDisplay {
     }
 }
 
-pub fn spawn_progress(mut rx: UnboundedReceiver<Status>) -> tokio::task::JoinHandle<Result<()>> {
-    tokio::spawn(async move {
-        let mut display = ProgressDisplay::new();
-        while let Some(status) = rx.recv().await {
-            display.handle(status);
+struct JsonDisplay {
+    fatal: bool,
+}
+
+impl JsonDisplay {
+    fn new() -> Self {
+        Self { fatal: false }
+    }
+
+    fn handle(&mut self, status: Status) {
+        if self.fatal {
+            return;
         }
-        display.finish()
+        match status {
+            Status::Begin { key, msg } => {
+                println!(
+                    "{}",
+                    serde_json::json!({"event": "begin", "key": key, "msg": msg})
+                );
+            }
+            Status::Update { key, msg } => {
+                println!(
+                    "{}",
+                    serde_json::json!({"event": "update", "key": key, "msg": msg})
+                );
+            }
+            Status::End { key, msg } => match msg {
+                Some(msg) => println!(
+                    "{}",
+                    serde_json::json!({"event": "end", "key": key, "msg": msg})
+                ),
+                None => println!("{}", serde_json::json!({"event": "end", "key": key})),
+            },
+            Status::Clear => {}
+            Status::Fatal(msg) => {
+                println!("{}", serde_json::json!({"event": "fatal", "msg": msg}));
+                self.fatal = true;
+            }
+            Status::Log(msg) => {
+                if !msg.is_empty() {
+                    println!("{}", serde_json::json!({"event": "log", "msg": msg}));
+                }
+            }
+            Status::Stdout(bytes) => {
+                let data = String::from_utf8_lossy(&bytes);
+                println!(
+                    "{}",
+                    serde_json::json!({"event": "stdout", "data": data.as_ref()})
+                );
+            }
+            Status::Stderr(bytes) => {
+                let data = String::from_utf8_lossy(&bytes);
+                println!(
+                    "{}",
+                    serde_json::json!({"event": "stderr", "data": data.as_ref()})
+                );
+            }
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        if self.fatal {
+            Err(anyhow::anyhow!(""))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+pub fn spawn_progress(mut rx: UnboundedReceiver<Status>) -> tokio::task::JoinHandle<Result<()>> {
+    let format = StatusHandle::get().format();
+    tokio::spawn(async move {
+        match format {
+            OutputFormat::Text => {
+                let mut display = ProgressDisplay::new();
+                while let Some(status) = rx.recv().await {
+                    display.handle(status);
+                }
+                display.finish()
+            }
+            OutputFormat::Json => {
+                let mut display = JsonDisplay::new();
+                while let Some(status) = rx.recv().await {
+                    display.handle(status);
+                }
+                display.finish()
+            }
+        }
     })
 }

@@ -38,9 +38,10 @@ impl Kotlin {
                     let status = crate::status::StatusHandle::get();
                     status.begin("kotlin", format!("downloading kotlinc {ver}"));
                     let result = Self::download(ver, build_dir).await;
-                    status.end("kotlin");
                     if result.is_ok() {
-                        status.log(format!("downloaded kotlinc {ver}"));
+                        status.end_log("kotlin", format!("downloaded kotlinc {ver}"));
+                    } else {
+                        status.end("kotlin");
                     }
                     result?
                 }

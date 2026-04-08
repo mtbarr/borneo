@@ -4,9 +4,19 @@ use clap::ValueHint;
 
 use crate::manifest::Packaging;
 
+#[derive(clap::ValueEnum, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(clap::Parser)]
 #[command(version, about = "A build tool for Java projects")]
 pub struct Cli {
+    #[arg(long, value_enum, global = true, default_value = "text")]
+    pub format: OutputFormat,
+
     #[command(subcommand)]
     pub command: Commands,
 }

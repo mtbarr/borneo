@@ -270,8 +270,8 @@ pub fn capture_cmd(cmd: &mut Command, name: &str) -> Result<std::process::Output
         .with_context(|| format!("failed to run {name}"))?;
     if !output.status.success() {
         let status = crate::status::StatusHandle::get();
-        status.output(output.stdout);
-        status.output(output.stderr);
+        status.stdout(output.stdout);
+        status.stderr(output.stderr);
         anyhow::bail!("{name} exited with {}", output.status);
     }
     Ok(output)

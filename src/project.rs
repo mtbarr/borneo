@@ -256,8 +256,8 @@ impl Project {
         } else {
             let default_kotlin = self.dir.join("src/main/kotlin");
             if default_kotlin.is_dir() {
-                eprintln!(
-                    "warning: src/main/kotlin exists but kotlin is not declared in the manifest"
+                status::StatusHandle::get().log(
+                    "warning: src/main/kotlin exists but kotlin is not declared in the manifest",
                 );
             }
         }
@@ -398,8 +398,8 @@ impl Project {
                         format!("post-build: {post_build}"),
                         || run_post_build(&self.dir, post_build, &final_jar),
                     )?;
-                    status.output(output.stdout);
-                    status.output(output.stderr);
+                    status.stdout(output.stdout);
+                    status.stderr(output.stderr);
                 }
 
                 Ok(Some(final_jar))
@@ -418,13 +418,13 @@ impl Project {
                     self.build_dir.display()
                 )
             })?;
-            eprintln!(
+            status::StatusHandle::get().log(format!(
                 "cleaned {}",
                 self.build_dir
                     .strip_prefix(&self.dir)
                     .unwrap_or(&self.build_dir)
                     .display()
-            );
+            ));
         }
         Ok(())
     }
@@ -473,7 +473,7 @@ impl Project {
         }
 
         if removed > 0 {
-            eprintln!("purged {removed} stale artifacts from cache");
+            status::StatusHandle::get().log(format!("purged {removed} stale artifacts from cache"));
         }
         Ok(())
     }
@@ -909,8 +909,8 @@ fn collect_source_files(source: &Path) -> Result<Vec<PathBuf>> {
 
 fn flush_output(output: &std::process::Output) {
     let status = status::StatusHandle::get();
-    status.output(output.stdout.clone());
-    status.output(output.stderr.clone());
+    status.stdout(output.stdout.clone());
+    status.stderr(output.stderr.clone());
 }
 
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
